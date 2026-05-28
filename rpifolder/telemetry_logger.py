@@ -24,7 +24,7 @@ import signal
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -91,6 +91,41 @@ def build_parser() -> argparse.ArgumentParser:
         default=3.0,
         help="Seconds to wait before restarting MAVProxy.",
     )
+    parser.add_argument(
+        "--capture-images",
+        action="store_true",
+        help="Capture images from a USB camera and pair each image with latest telemetry.",
+    )
+    parser.add_argument(
+        "--camera-index",
+        type=int,
+        default=0,
+        help="OpenCV camera index for the USB camera. Index 0 usually maps to /dev/video0.",
+    )
+    parser.add_argument(
+        "--capture-interval",
+        type=float,
+        default=1.0,
+        help="Seconds between image captures when --capture-images is enabled.",
+    )
+    parser.add_argument(
+        "--image-width",
+        type=int,
+        default=None,
+        help="Optional camera capture width. Leave unset to use the camera default.",
+    )
+    parser.add_argument(
+        "--image-height",
+        type=int,
+        default=None,
+        help="Optional camera capture height. Leave unset to use the camera default.",
+    )
+    parser.add_argument(
+        "--jpeg-quality",
+        type=int,
+        default=90,
+        help="JPEG quality for saved images, from 1 to 100.",
+    )
     return parser
 
 
@@ -101,8 +136,16 @@ class TelemetryState:
     gps_locked: bool = False
     heading_degrees: float = 0.0
     altitude_m: float = 0.0
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
+        with self.lock:
+            return self._to_dict_unlocked()
+
+    def snapshot(self) -> dict[str, Any]:
+        return self.to_dict()
+
+    def _to_dict_unlocked(self) -> dict[str, Any]:
         latitude = self.latitude if self.gps_locked else 0.0
         longitude = self.longitude if self.gps_locked else 0.0
         return {
@@ -154,6 +197,13 @@ def write_session_info(session_dir: Path, command: list[str], args: argparse.Nam
         info_file.write(f"baudrate={args.baudrate}\n")
         info_file.write(f"outputs={','.join(args.out if args.out else [DEFAULT_OUT])}\n")
         info_file.write(f"telemetry_in={args.telemetry_in}\n")
+        info_file.write(f"capture_images={args.capture_images}\n")
+        if args.capture_images:
+            info_file.write(f"camera_index={args.camera_index}\n")
+            info_file.write(f"capture_interval={args.capture_interval}\n")
+            info_file.write(f"image_width={args.image_width}\n")
+            info_file.write(f"image_height={args.image_height}\n")
+            info_file.write(f"jpeg_quality={args.jpeg_quality}\n")
         info_file.write("command=" + " ".join(command) + "\n")
 
 
@@ -162,6 +212,11 @@ def normalize_heading(heading: float) -> float:
 
 
 def update_telemetry_from_message(state: TelemetryState, message: object) -> None:
+    with state.lock:
+        update_telemetry_from_message_unlocked(state, message)
+
+
+def update_telemetry_from_message_unlocked(state: TelemetryState, message: object) -> None:
     message_type = message.get_type()
 
     if message_type == "GPS_RAW_INT":
@@ -209,11 +264,135 @@ def update_telemetry_from_message(state: TelemetryState, message: object) -> Non
             state.heading_degrees = normalize_heading(math.degrees(float(yaw)))
 
 
-def telemetry_reader(endpoint: str, session_dir: Path, print_rate: float, stop_event: threading.Event) -> None:
+def image_filename(sequence: int) -> str:
+    return f"image_{sequence:06d}.jpg"
+
+
+def make_image_manifest_record(
+    sequence: int,
+    image_path: Path,
+    captured_at: str,
+    camera_index: int,
+    width: int,
+    height: int,
+    telemetry: dict[str, Any],
+    capture_ok: bool,
+    error: str | None = None,
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "sequence": sequence,
+        "image_path": str(image_path),
+        "captured_at": captured_at,
+        "camera_index": camera_index,
+        "width": width,
+        "height": height,
+        "telemetry": telemetry,
+        "capture_ok": capture_ok,
+    }
+    if error:
+        record["error"] = error
+    return record
+
+
+def image_capture_worker(
+    session_dir: Path,
+    args: argparse.Namespace,
+    telemetry_state: TelemetryState,
+    stop_event: threading.Event,
+) -> None:
+    image_log_path = session_dir / "image_capture.log"
+    manifest_path = session_dir / "image_manifest.jsonl"
+    images_dir = session_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    with image_log_path.open("a", encoding="utf-8", buffering=1) as image_log:
+        image_log.write(f"\n[{dt.datetime.now().isoformat(timespec='seconds')}] starting image capture\n")
+
+        try:
+            import cv2
+        except ImportError as exc:
+            image_log.write(f"OpenCV import failed: {exc}\n")
+            image_log.write("Install OpenCV on Raspberry Pi with: sudo apt install python3-opencv\n")
+            return
+
+        camera = cv2.VideoCapture(args.camera_index)
+        try:
+            if args.image_width is not None:
+                camera.set(cv2.CAP_PROP_FRAME_WIDTH, args.image_width)
+            if args.image_height is not None:
+                camera.set(cv2.CAP_PROP_FRAME_HEIGHT, args.image_height)
+
+            if not camera.isOpened():
+                image_log.write(f"Camera index {args.camera_index} failed to open\n")
+                return
+
+            sequence = 1
+            next_capture_at = 0.0
+            interval = max(args.capture_interval, 0.1)
+            jpeg_quality = min(max(args.jpeg_quality, 1), 100)
+
+            with manifest_path.open("a", encoding="utf-8", buffering=1) as manifest:
+                while not stop_event.is_set():
+                    now = time.monotonic()
+                    if now < next_capture_at:
+                        stop_event.wait(min(0.05, next_capture_at - now))
+                        continue
+
+                    captured_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds")
+                    image_path = images_dir / image_filename(sequence)
+                    telemetry = telemetry_state.snapshot()
+                    capture_ok = False
+                    error = None
+                    width = 0
+                    height = 0
+
+                    ok, frame = camera.read()
+                    if not ok or frame is None:
+                        error = "Camera frame capture failed"
+                        image_log.write(f"[{captured_at}] {error}\n")
+                    else:
+                        height, width = frame.shape[:2]
+                        write_ok = cv2.imwrite(
+                            str(image_path),
+                            frame,
+                            [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality],
+                        )
+                        if write_ok:
+                            capture_ok = True
+                        else:
+                            error = f"Failed to write image to {image_path}"
+                            image_log.write(f"[{captured_at}] {error}\n")
+
+                    record = make_image_manifest_record(
+                        sequence=sequence,
+                        image_path=image_path,
+                        captured_at=captured_at,
+                        camera_index=args.camera_index,
+                        width=width,
+                        height=height,
+                        telemetry=telemetry,
+                        capture_ok=capture_ok,
+                        error=error,
+                    )
+                    manifest.write(json.dumps(record) + "\n")
+
+                    sequence += 1
+                    next_capture_at = now + interval
+        finally:
+            camera.release()
+            image_log.write(f"[{dt.datetime.now().isoformat(timespec='seconds')}] image capture stopped\n")
+
+
+def telemetry_reader(
+    endpoint: str,
+    session_dir: Path,
+    print_rate: float,
+    telemetry_state: TelemetryState,
+    stop_event: threading.Event,
+) -> None:
     from pymavlink import mavutil
 
     telemetry_log_path = session_dir / "telemetry_json.log"
-    state = TelemetryState()
     next_print_at = 0.0
     interval = 1.0 / print_rate if print_rate > 0 else 1.0
 
@@ -224,11 +403,11 @@ def telemetry_reader(endpoint: str, session_dir: Path, print_rate: float, stop_e
         while not stop_event.is_set():
             message = mavlink.recv_match(blocking=False)
             if message is not None:
-                update_telemetry_from_message(state, message)
+                update_telemetry_from_message(telemetry_state, message)
 
             now = time.monotonic()
             if now >= next_print_at:
-                line = json.dumps(state.to_dict())
+                line = json.dumps(telemetry_state.snapshot())
                 print(line, flush=True)
                 telemetry_log.write(line + "\n")
                 next_print_at = now + interval
@@ -253,17 +432,27 @@ def run_mavproxy(command: list[str], session_dir: Path, args: argparse.Namespace
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     stop_event = threading.Event()
+    telemetry_state = TelemetryState()
     reader_thread = threading.Thread(
         target=telemetry_reader,
-        args=(args.telemetry_in, session_dir, args.print_rate, stop_event),
+        args=(args.telemetry_in, session_dir, args.print_rate, telemetry_state, stop_event),
         daemon=True,
     )
+    image_thread = None
+    if args.capture_images:
+        image_thread = threading.Thread(
+            target=image_capture_worker,
+            args=(session_dir, args, telemetry_state, stop_event),
+            daemon=True,
+        )
 
     with console_log_path.open("a", encoding="utf-8", buffering=1) as console_log:
         console_log.write(f"\n[{dt.datetime.now().isoformat(timespec='seconds')}] starting MAVProxy\n")
         console_log.write("command: " + " ".join(command) + "\n\n")
 
         reader_thread.start()
+        if image_thread is not None:
+            image_thread.start()
 
         process = subprocess.Popen(
             command,
@@ -303,6 +492,8 @@ def run_mavproxy(command: list[str], session_dir: Path, args: argparse.Namespace
             stop_event.set()
             terminate_process(process)
             reader_thread.join(timeout=2.0)
+            if image_thread is not None:
+                image_thread.join(timeout=2.0)
             console_log.write(f"\n[{dt.datetime.now().isoformat(timespec='seconds')}] MAVProxy stopped\n")
 
 
@@ -316,6 +507,10 @@ def main() -> int:
     print("MAVProxy command: " + " ".join(command))
     print("Console log: " + str(session_dir / "mavproxy_console.log"))
     print("Telemetry JSON log: " + str(session_dir / "telemetry_json.log"))
+    if args.capture_images:
+        print("Image directory: " + str(session_dir / "images"))
+        print("Image manifest: " + str(session_dir / "image_manifest.jsonl"))
+        print("Image capture log: " + str(session_dir / "image_capture.log"))
 
     while True:
         return_code = run_mavproxy(command, session_dir, args)
