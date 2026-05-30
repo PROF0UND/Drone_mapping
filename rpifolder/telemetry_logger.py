@@ -103,6 +103,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="OpenCV camera index for the USB camera. Index 0 usually maps to /dev/video0.",
     )
     parser.add_argument(
+        "--camera-device",
+        default=None,
+        help="Explicit Linux video device path, such as /dev/video2. Overrides --camera-index.",
+    )
+    parser.add_argument(
         "--capture-interval",
         type=float,
         default=1.0,
@@ -200,6 +205,7 @@ def write_session_info(session_dir: Path, command: list[str], args: argparse.Nam
         info_file.write(f"capture_images={args.capture_images}\n")
         if args.capture_images:
             info_file.write(f"camera_index={args.camera_index}\n")
+            info_file.write(f"camera_device={args.camera_device}\n")
             info_file.write(f"capture_interval={args.capture_interval}\n")
             info_file.write(f"image_width={args.image_width}\n")
             info_file.write(f"image_height={args.image_height}\n")
@@ -294,6 +300,18 @@ def make_image_manifest_record(
     return record
 
 
+def camera_source(args: argparse.Namespace) -> int | str:
+    if args.camera_device:
+        return args.camera_device
+    return args.camera_index
+
+
+def open_camera(cv2: object, source: int | str) -> object:
+    if isinstance(source, str) and source.startswith("/dev/video"):
+        return cv2.VideoCapture(source, cv2.CAP_V4L2)
+    return cv2.VideoCapture(source)
+
+
 def image_capture_worker(
     session_dir: Path,
     args: argparse.Namespace,
@@ -315,15 +333,26 @@ def image_capture_worker(
             image_log.write("Install OpenCV on Raspberry Pi with: sudo apt install python3-opencv\n")
             return
 
-        camera = cv2.VideoCapture(args.camera_index)
+        source = camera_source(args)
+        camera = None
         try:
-            if args.image_width is not None:
-                camera.set(cv2.CAP_PROP_FRAME_WIDTH, args.image_width)
-            if args.image_height is not None:
-                camera.set(cv2.CAP_PROP_FRAME_HEIGHT, args.image_height)
+            while not stop_event.is_set():
+                camera = open_camera(cv2, source)
+                if args.image_width is not None:
+                    camera.set(cv2.CAP_PROP_FRAME_WIDTH, args.image_width)
+                if args.image_height is not None:
+                    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, args.image_height)
 
-            if not camera.isOpened():
-                image_log.write(f"Camera index {args.camera_index} failed to open\n")
+                if camera.isOpened():
+                    image_log.write(f"Camera source {source!r} opened\n")
+                    break
+
+                image_log.write(f"Camera source {source!r} failed to open; retrying in 2 seconds\n")
+                camera.release()
+                camera = None
+                stop_event.wait(2.0)
+
+            if camera is None or not camera.isOpened():
                 return
 
             sequence = 1
@@ -379,7 +408,8 @@ def image_capture_worker(
                     sequence += 1
                     next_capture_at = now + interval
         finally:
-            camera.release()
+            if camera is not None:
+                camera.release()
             image_log.write(f"[{dt.datetime.now().isoformat(timespec='seconds')}] image capture stopped\n")
 
 

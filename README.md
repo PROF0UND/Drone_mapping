@@ -67,7 +67,7 @@ Run telemetry logging and capture one image per second:
 
 ```bash
 cd ~/mapping/rpifolder
-python3 telemetry_logger.py --capture-images --capture-interval 1
+python3 telemetry_logger.py --capture-images --camera-device /dev/video0 --capture-interval 1
 ```
 
 Useful options:
@@ -75,6 +75,7 @@ Useful options:
 ```bash
 python3 telemetry_logger.py --capture-images --capture-interval 5
 python3 telemetry_logger.py --capture-images --camera-index 1
+python3 telemetry_logger.py --capture-images --camera-device /dev/video0
 python3 telemetry_logger.py --capture-images --image-width 1280 --image-height 720
 ```
 
@@ -90,6 +91,46 @@ image_capture.log        # Camera capture status/errors
 ```
 
 Each image manifest row includes the image path, capture timestamp, camera index, image size, capture status, and the latest telemetry snapshot.
+
+### Start Automatically On Boot
+
+Install the included `systemd` service so the Pi starts logging as soon as it powers on:
+
+```bash
+cd ~/mapping/rpifolder
+sudo bash install_telemetry_service.sh
+sudo systemctl start telemetry-logger.service
+```
+
+The service runs this command:
+
+```bash
+python3 /home/profound/mapping/rpifolder/telemetry_logger.py --capture-images --camera-device /dev/video0 --capture-interval 1 --restart
+```
+
+Check whether it is running:
+
+```bash
+systemctl status telemetry-logger.service
+```
+
+Watch live service logs:
+
+```bash
+journalctl -u telemetry-logger.service -f
+```
+
+Stop it manually:
+
+```bash
+sudo systemctl stop telemetry-logger.service
+```
+
+Disable automatic startup:
+
+```bash
+sudo systemctl disable telemetry-logger.service
+```
 
 ## Stitching Workflow
 

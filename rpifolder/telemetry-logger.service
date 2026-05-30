@@ -1,0 +1,17 @@
+[Unit]
+Description=Drone telemetry and image logger
+After=multi-user.target
+Wants=multi-user.target
+
+[Service]
+Type=simple
+User=profound
+Group=video
+WorkingDirectory=/home/profound/mapping/rpifolder
+ExecStart=/usr/bin/python3 /home/profound/mapping/rpifolder/telemetry_logger.py --capture-images --camera-device /dev/video0 --capture-interval 1 --restart
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
