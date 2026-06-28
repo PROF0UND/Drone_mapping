@@ -131,6 +131,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=90,
         help="JPEG quality for saved images, from 1 to 100.",
     )
+    parser.add_argument(
+        "--wait-device",
+        action="append",
+        default=None,
+        help="Device path that must exist before logging starts. May be passed more than once.",
+    )
+    parser.add_argument(
+        "--device-wait-timeout",
+        type=float,
+        default=60.0,
+        help="Seconds to wait for each --wait-device path before exiting.",
+    )
     return parser
 
 
@@ -169,6 +181,31 @@ def make_session_dir(log_root: str) -> Path:
     session_dir = root / f"telemetry_{timestamp}"
     session_dir.mkdir(parents=True, exist_ok=False)
     return session_dir
+
+
+def wait_for_device(path: str, timeout_seconds: float) -> bool:
+    deadline = time.monotonic() + max(timeout_seconds, 0.0)
+    device_path = Path(path)
+
+    while True:
+        if device_path.exists():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.5)
+
+
+def wait_for_required_devices(paths: list[str] | None, timeout_seconds: float) -> bool:
+    if not paths:
+        return True
+
+    for path in paths:
+        print(f"Waiting for {path}...", flush=True)
+        if not wait_for_device(path, timeout_seconds):
+            print(f"Timed out waiting for {path}", flush=True)
+            return False
+
+    return True
 
 
 def build_mavproxy_command(args: argparse.Namespace, session_dir: Path) -> list[str]:
@@ -529,6 +566,9 @@ def run_mavproxy(command: list[str], session_dir: Path, args: argparse.Namespace
 
 def main() -> int:
     args = build_parser().parse_args()
+    if not wait_for_required_devices(args.wait_device, args.device_wait_timeout):
+        return 1
+
     session_dir = make_session_dir(args.log_root)
     command = build_mavproxy_command(args, session_dir)
     write_session_info(session_dir, command, args)

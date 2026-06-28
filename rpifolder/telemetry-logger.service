@@ -1,17 +1,22 @@
 [Unit]
 Description=Drone telemetry and image logger
-After=multi-user.target
-Wants=multi-user.target
+After=multi-user.target dev-video0.device dev-serial0.device
+Wants=multi-user.target dev-video0.device dev-serial0.device
+StartLimitIntervalSec=120
+StartLimitBurst=6
 
 [Service]
 Type=simple
 User=profound
-Group=video
-WorkingDirectory=/home/profound/mapping/rpifolder
-ExecStart=/usr/bin/python3 /home/profound/mapping/rpifolder/telemetry_logger.py --capture-images --camera-device /dev/video0 --capture-interval 1 --restart
-Restart=always
-RestartSec=5
+SupplementaryGroups=video dialout plugdev
+WorkingDirectory=/home/profound/mapping
+ExecStartPre=/bin/sh -c 'for device in /dev/serial0 /dev/video0; do i=0; while [ ! -e "$device" ] && [ "$i" -lt 60 ]; do sleep 1; i=$((i + 1)); done; [ -e "$device" ] || exit 1; done'
+ExecStart=/usr/bin/python3 /home/profound/telemetry_logger.py --capture-images --camera-device /dev/video0 --capture-interval 1 --restart
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=90
 Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/home/profound/.local/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=multi-user.target

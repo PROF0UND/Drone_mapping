@@ -1,4 +1,5 @@
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -6,6 +7,7 @@ from rpifolder.telemetry_logger import (
     TelemetryState,
     image_filename,
     make_image_manifest_record,
+    wait_for_required_devices,
 )
 
 
@@ -90,6 +92,19 @@ class TelemetryLoggerTests(unittest.TestCase):
         )
 
         self.assertEqual(record["error"], "Camera frame capture failed")
+
+    def test_wait_for_required_devices_accepts_existing_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            device_path = Path(temp_dir) / "video0"
+            device_path.touch()
+
+            self.assertTrue(wait_for_required_devices([str(device_path)], 0.01))
+
+    def test_wait_for_required_devices_rejects_missing_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            device_path = Path(temp_dir) / "missing"
+
+            self.assertFalse(wait_for_required_devices([str(device_path)], 0.01))
 
 
 if __name__ == "__main__":
