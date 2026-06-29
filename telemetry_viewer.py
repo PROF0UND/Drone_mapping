@@ -7,12 +7,18 @@ Usage: python telemetry_viewer.py [--port /dev/serial0] [--baud 460800]
 import argparse
 import math
 import os
-import subprocess
 import threading
 import time
 import sys
 from collections import deque
 from datetime import datetime
+
+try:
+    from picamera2 import Picamera2
+    _PICAM_AVAILABLE = True
+except ImportError:
+    Picamera2 = None       # type: ignore[assignment,misc]
+    _PICAM_AVAILABLE = False
 
 try:
     from pymavlink import mavutil
@@ -38,10 +44,15 @@ RC_MAX = 2000
 BAR_WIDTH = 36
 MAX_LOGS = 25
 
-# Camera trigger — CH9 rising edge above this PWM fires a capture
+# CH9 — single shot on rising edge
 CAM_CHANNEL       = 9
 CAM_THRESHOLD     = 1800   # "high" position; raise to 1950+ if you only want >2000
-CAM_COOLDOWN_S    = 2.0    # minimum seconds between captures
+CAM_COOLDOWN_S    = 2.0    # minimum seconds between single-shot captures
+
+# CH7 — continuous burst while the switch is held high
+CAM_BURST_CHANNEL   = 7
+CAM_BURST_THRESHOLD = 1800  # your TX sends ~2011 at full deflection
+
 PHOTO_DIR         = os.path.join(os.path.dirname(os.path.abspath(__file__)), "photos")
 PHOTO_W, PHOTO_H  = 4056, 3040
 
@@ -52,7 +63,7 @@ RC_LABELS = {
     4: "Yaw",
     5: "Mode SW",
     6: "CH 6",
-    7: "CH 7",
+    7: "AutoShot",
     8: "CH 8",
     9: "Camera",
     10: "CH 10",
@@ -124,16 +135,60 @@ def log(msg: str, level: str = "INFO"):
 
 # ── Camera state ──────────────────────────────────────────────────────────────
 cam = {
-    "ch_was_high":  False,   # previous-frame high/low for edge detection
-    "capturing":    False,   # True while rpicam-still is running
-    "last_capture": 0.0,     # time.time() of last successful trigger
-    "photo_count":  0,
-    "last_file":    "",
+    "ch_was_high":   False,  # CH9 edge detection
+    "ch7_was_high":  False,  # CH7 edge detection
+    "capturing":     False,  # True while a capture is in progress
+    "burst_active":  False,  # True while CH7 is held high
+    "ready":         False,  # True once Picamera2 has finished warmup
+    "last_capture":  0.0,    # time.time() of last successful capture
+    "photo_count":   0,
+    "last_file":     "",
 }
+
+_picam    = None   # global Picamera2 instance, set by init_camera()
+_mav_conn = None   # live MAVLink connection, set by mav_thread()
+
+
+def send_statustext(text: str, severity: int | None = None) -> None:
+    """Send a STATUSTEXT to the FC so it appears in Mission Planner messages."""
+    if _mav_conn is None:
+        return
+    if severity is None:
+        severity = mavutil.mavlink.MAV_SEVERITY_INFO
+    try:
+        # STATUSTEXT payload is exactly 50 bytes, null-padded
+        encoded = text.encode("utf-8")[:50].ljust(50, b"\x00")
+        _mav_conn.mav.statustext_send(severity, encoded)
+    except Exception as exc:
+        log(f"[MAV] statustext failed: {exc}", "WARNING")
+
+
+def init_camera():
+    """Open Picamera2 once at startup and hold it warm. Runs in a thread."""
+    global _picam
+    if not _PICAM_AVAILABLE or Picamera2 is None:
+        log("[Camera] picamera2 not installed — camera disabled", "WARNING")
+        return
+    try:
+        log("[Camera] Initialising Picamera2…", "INFO")
+        _picam = Picamera2()
+        cfg = _picam.create_still_configuration(main={"size": (PHOTO_W, PHOTO_H)})
+        _picam.configure(cfg)
+        _picam.start()
+        time.sleep(2)          # one-time sensor warmup
+        cam["ready"] = True
+        log("[Camera] Ready — waiting for CH9 trigger", "OK")
+    except Exception as exc:
+        log(f"[Camera] Init failed: {exc}", "ERROR")
 
 
 def capture_photo(photo_dir: str):
-    """Fire rpicam-still in a background thread; called on rising edge only."""
+    """Capture via the warm Picamera2 instance; called on rising edge only."""
+    if not cam["ready"] or _picam is None:
+        log("[Camera] Not ready yet — skipping", "WARNING")
+        return
+
+    picam = _picam   # local ref: non-None past the guard above
     cam["capturing"]   = True
     cam["photo_count"] += 1
     count = cam["photo_count"]
@@ -143,29 +198,10 @@ def capture_photo(photo_dir: str):
     def _run():
         try:
             log(f"[Camera] Capturing → {os.path.basename(path)}", "NOTICE")
-            result = subprocess.run(
-                [
-                    "rpicam-still",
-                    "-o", path,
-                    "--width",  str(PHOTO_W),
-                    "--height", str(PHOTO_H),
-                    "--nopreview",
-                ],
-                timeout=20,
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode == 0:
-                cam["last_file"]    = path
-                cam["last_capture"] = time.time()
-                log(f"[Camera] Saved  #{count}  {os.path.basename(path)}", "OK")
-            else:
-                err = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "unknown"
-                log(f"[Camera] Error: {err}", "ERROR")
-        except subprocess.TimeoutExpired:
-            log("[Camera] Timed out after 20 s", "ERROR")
-        except FileNotFoundError:
-            log("[Camera] rpicam-still not found — is it installed?", "ERROR")
+            picam.capture_file(path)
+            cam["last_file"]    = path
+            cam["last_capture"] = time.time()
+            log(f"[Camera] Saved #{count}  {os.path.basename(path)}", "OK")
         except Exception as exc:
             log(f"[Camera] {exc}", "ERROR")
         finally:
@@ -176,6 +212,7 @@ def capture_photo(photo_dir: str):
 
 # ── MAVLink receive thread ────────────────────────────────────────────────────
 def mav_thread(port: str, baud: int):
+    global _mav_conn
     log(f"Connecting → {port}  @{baud} baud", "INFO")
     try:
         conn = mavutil.mavlink_connection(port, baud=baud)
@@ -190,6 +227,7 @@ def mav_thread(port: str, baud: int):
         log(f"No heartbeat: {e}", "ERROR")
         return
 
+    _mav_conn = conn   # expose connection for send_statustext()
     with _lock:
         state["connected"] = True
     log(f"Heartbeat OK  sys={conn.target_system}  comp={conn.target_component}", "OK")
@@ -289,24 +327,52 @@ def _rc_bar(pwm: int, width: int = BAR_WIDTH) -> Text:
 
 
 # ── Panel builders ────────────────────────────────────────────────────────────
-def build_rc_panel(rc: dict) -> Panel:
+def build_rc_panel(rc: dict, cam_snap: dict) -> Panel:
     tbl = Table(box=None, show_header=False, padding=(0, 1), expand=True)
-    tbl.add_column("CH",    width=3,          style="dim cyan",   justify="right")
-    tbl.add_column("Name",  width=9)
-    tbl.add_column("Bar",   width=BAR_WIDTH + 2)
-    tbl.add_column("PWM",   width=5,          justify="right",    style="white")
-    tbl.add_column("%",     width=4,          justify="right",    style="dim")
+    tbl.add_column("CH",     width=3,           style="dim cyan",  justify="right")
+    tbl.add_column("Name",   width=9)
+    tbl.add_column("Bar",    width=BAR_WIDTH + 2)
+    tbl.add_column("PWM",    width=5,           justify="right",   style="white")
+    tbl.add_column("%",      width=4,           justify="right",   style="dim")
+    tbl.add_column("Status", width=14)
 
     if not rc:
-        tbl.add_row("—", "No RC data", Text("Waiting for RC_CHANNELS message…", style="dim"), "", "")
+        tbl.add_row("—", "No RC data", Text("Waiting for RC_CHANNELS message…", style="dim"), "", "", "")
     else:
         for ch in sorted(rc):
-            pwm = rc[ch]
-            pct = int((pwm - RC_MIN) / (RC_MAX - RC_MIN) * 100)
+            pwm  = rc[ch]
+            pct  = int(max(0, min(100, (pwm - RC_MIN) / (RC_MAX - RC_MIN) * 100)))
             label = RC_LABELS.get(ch, f"CH {ch}")
-            tbl.add_row(str(ch), label, _rc_bar(pwm), str(pwm), f"{pct}%")
+            status = Text("")
 
-    return Panel(tbl, title="[bold cyan]RC Channels[/bold cyan]", border_style="cyan")
+            if ch == CAM_BURST_CHANNEL:
+                if cam_snap["burst_active"] and cam_snap["capturing"]:
+                    status = Text("◉ BURST",    style="bold magenta")
+                elif cam_snap["burst_active"]:
+                    status = Text("▶ BURST ON", style="bold yellow")
+                else:
+                    status = Text("○ off",      style="dim")
+
+            elif ch == CAM_CHANNEL:
+                if cam_snap["capturing"] and not cam_snap["burst_active"]:
+                    status = Text("◉ CAPTURING", style="bold magenta")
+                elif pwm >= CAM_THRESHOLD:
+                    status = Text("● TRIGGERED", style="bold yellow")
+                else:
+                    status = Text("○ standby",   style="dim green")
+
+            tbl.add_row(str(ch), label, _rc_bar(pwm), str(pwm), f"{pct}%", status)
+
+    # Camera summary in panel title
+    count = cam_snap["photo_count"]
+    last  = os.path.basename(cam_snap["last_file"]) if cam_snap["last_file"] else "none"
+    cam_info = (
+        f"  [dim]Photos: [bold white]{count}[/bold white]  "
+        f"Last: [white]{last}[/white][/dim]"
+        if count else ""
+    )
+    title = f"[bold cyan]RC Channels[/bold cyan]{cam_info}"
+    return Panel(tbl, title=title, border_style="cyan")
 
 
 def build_telem_panel(s: dict) -> Panel:
@@ -392,10 +458,15 @@ def build_log_panel(log_snapshot: list) -> Panel:
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="MAVLink telemetry + RC viewer")
-    parser.add_argument("--port",  default="/dev/serial0", help="Serial port")
-    parser.add_argument("--baud",  default=460800, type=int, help="Baud rate")
+    parser.add_argument("--port",      default="/dev/serial0", help="Serial port")
+    parser.add_argument("--baud",      default=460800, type=int, help="Baud rate")
+    parser.add_argument("--photo-dir", default=PHOTO_DIR, help="Directory for captured photos")
     args = parser.parse_args()
 
+    os.makedirs(args.photo_dir, exist_ok=True)
+    log(f"Photos will be saved to: {args.photo_dir}", "INFO")
+
+    threading.Thread(target=init_camera, daemon=True).start()
     threading.Thread(
         target=mav_thread, args=(args.port, args.baud), daemon=True
     ).start()
@@ -414,10 +485,43 @@ def main():
                 with _lock:
                     snap = {k: (dict(v) if isinstance(v, dict) else v)
                             for k, v in state.items()}
-                    log_snap = list(logs)
+                    log_snap  = list(logs)
+                    cam_snap  = dict(cam)
+
+                # ── CH7: continuous burst while switch is held high ─────────
+                ch7_pwm  = snap["rc"].get(CAM_BURST_CHANNEL, 0)
+                ch7_high = ch7_pwm >= CAM_BURST_THRESHOLD
+
+                if ch7_high and not cam["ch7_was_high"]:
+                    # rising edge — start burst
+                    cam["burst_active"] = True
+                    send_statustext("RPi: taking pictures", mavutil.mavlink.MAV_SEVERITY_INFO)
+                    log("[Burst] Started — CH7 high", "NOTICE")
+
+                if not ch7_high and cam["ch7_was_high"]:
+                    # falling edge — stop burst
+                    cam["burst_active"] = False
+                    send_statustext("RPi: camera stopped", mavutil.mavlink.MAV_SEVERITY_INFO)
+                    log("[Burst] Stopped — CH7 low", "NOTICE")
+
+                cam["ch7_was_high"] = ch7_high
+
+                # Fire next burst frame as soon as the previous capture finishes
+                if cam["burst_active"] and not cam["capturing"]:
+                    capture_photo(args.photo_dir)
+
+                # ── CH9: single shot on rising edge ─────────────────────────
+                ch9_pwm  = snap["rc"].get(CAM_CHANNEL, 0)
+                ch9_high = ch9_pwm >= CAM_THRESHOLD
+                cooldown_ok = (time.time() - cam["last_capture"]) >= CAM_COOLDOWN_S
+
+                if ch9_high and not cam["ch_was_high"] and not cam["capturing"] and cooldown_ok:
+                    capture_photo(args.photo_dir)
+
+                cam["ch_was_high"] = ch9_high
 
                 layout["telem"].update(build_telem_panel(snap))
-                layout["rc"].update(build_rc_panel(snap["rc"]))
+                layout["rc"].update(build_rc_panel(snap["rc"], cam_snap))
                 layout["log"].update(build_log_panel(log_snap))
                 time.sleep(0.067)   # ~15 fps
         except KeyboardInterrupt:
